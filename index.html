@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>QuickDrop 快速傳檔</title>
+<meta name="description" content="上傳檔案取得取件連結，對方下載後自動刪除。">
+<meta name="theme-color" content="#1c7ed6">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css?v=2">
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <div class="brand"><span class="dot"></span>QuickDrop <small>快速傳檔</small></div>
+  </div>
+</header>
+
+<main class="wrap">
+  <div id="configBanner" class="banner hidden">尚未設定後端網址（index.html 裡的 <code>SUPABASE_URL</code>）。</div>
+
+  <!-- 上傳端 -->
+  <div id="sendView" class="hidden">
+    <section class="card drop" id="pickCard">
+      <h2>傳送檔案</h2>
+      <input type="file" id="fileInput" multiple>
+      <p class="hint" style="margin:8px 0 0">也可以把檔案拖曳到這裡。單檔上限 50 MB。</p>
+      <div class="list" id="sendList"></div>
+      <div class="row" style="margin-top:12px">
+        <label class="row" style="gap:6px"><input type="checkbox" id="optOnce" checked style="width:18px;height:18px"> 對方下載後自動刪除</label>
+        <div class="spacer"></div>
+        <select id="optTtl" style="width:auto" aria-label="保存期限">
+          <option value="60">保存 1 小時</option>
+          <option value="1440" selected>保存 24 小時</option>
+          <option value="10080">保存 7 天</option>
+        </select>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <input type="password" id="password" class="grow" placeholder="上傳密碼" autocomplete="off">
+        <label class="row" style="gap:6px"><input type="checkbox" id="optRemember" style="width:18px;height:18px"> 在這台電腦記住</label>
+        <button class="btn primary" id="btnUpload" disabled>上傳並建立取件連結</button>
+      </div>
+      <p class="hint" id="upStatus" style="margin:8px 0 0"></p>
+    </section>
+
+    <section class="card hidden" id="shareCard">
+      <h2>取件連結</h2>
+      <div class="row">
+        <input type="text" id="shareUrl" class="grow" readonly spellcheck="false">
+        <button class="btn" id="btnCopy">複製</button>
+      </div>
+      <p class="hint" id="shareStatus" style="margin:8px 0 0"></p>
+      <div class="row" style="margin-top:8px">
+        <button class="btn" id="btnAgain">再傳一批</button>
+        <button class="btn danger" id="btnRevoke">立即刪除這批檔案</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- 取件端 -->
+  <div id="recvView" class="hidden">
+    <div class="banner" id="recvStatus">讀取中…</div>
+    <div class="row" style="margin-top:16px">
+      <label class="row" style="gap:6px"><input type="checkbox" id="selAll" style="width:18px;height:18px"> 全選</label>
+      <div class="spacer"></div>
+      <button class="btn primary" id="btnDl" disabled>下載所選</button>
+    </div>
+    <p class="hint" id="dlHint" style="margin:6px 0 0"></p>
+    <div class="list" id="recvList"></div>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(() => {
+  'use strict';
+  // 後端（Supabase 專案）網址，例如 https://abcdefgh.supabase.co
+  const SUPABASE_URL = '';
+  const BUCKET = 'drops';
+  const MAX_FILE = 50 * 1024 * 1024;
+  const PW_KEY = 'quickdrop.password';
+
+  const $ = s => document.querySelector(s);
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  let toastTimer;
+  function toast(msg, isErr) {
+    const t = $('#toast');
+    t.textContent = msg;
+    t.className = 'toast show' + (isErr ? ' err' : '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.className = 'toast', isErr ? 5000 : 2500);
+  }
+  function fmtSize(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
+    return (n / 1024 / 1024).toFixed(1) + ' MB';
+  }
+  function fmtTime(iso) {
+    const d = new Date(iso);
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  function escapeHtml(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+  function row(f, status, pct, lead, cls) {
+    return `<div class="item" data-id="${escapeHtml(f.id)}">
+      ${lead || ''}
+      <div class="body">
+        <div class="url">${escapeHtml(f.name)}</div>
+        <div class="meta"><span>${fmtSize(f.size)}</span>${status ? `<span>${escapeHtml(status)}</span>` : ''}</div>
+        ${pct == null ? '' : `<div class="progress ${cls || ''}"><i style="width:${(pct * 100).toFixed(0)}%"></i></div>`}
+      </div>
+    </div>`;
+  }
+
+  async function api(action, payload) {
+    let res;
+    try {
+      res = await fetch(SUPABASE_URL + '/functions/v1/drop', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, ...payload }),
+      });
+    } catch { throw new Error('連不上伺服器，請檢查網路'); }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || data.message || `伺服器錯誤（${res.status}）`);
+    return data;
+  }
+
+  const code = location.hash.slice(1);
+  if (!SUPABASE_URL) $('#configBanner').classList.remove('hidden');
+  else if (code) receiver(code);
+  else sender();
+
+  // ================= 上傳端 =================
+  function sender() {
+    $('#sendView').classList.remove('hidden');
+    let picks = [];       // { id, name, size, file, pct, state: ready | uploading | done | error }
+    let nextId = 1;
+    let busy = false;
+    let dropId = null;
+
+    try {
+      const saved = localStorage.getItem(PW_KEY);
+      if (saved) { $('#password').value = saved; $('#optRemember').checked = true; }
+    } catch {}
+
+    function render() {
+      const text = { uploading: '上傳中', done: '已上傳', error: '上傳失敗' };
+      $('#sendList').innerHTML = picks.map(p => row(p, p.size > MAX_FILE ? '超過 50 MB，無法上傳' : text[p.state] || '',
+        p.state === 'ready' ? null : p.pct,
+        busy || dropId ? '' : '<button class="btn ghost small" data-rm title="移除">✕</button>',
+        p.state === 'done' ? 'done' : p.state === 'error' ? 'error' : '')).join('');
+      const ok = picks.length && picks.every(p => p.size <= MAX_FILE);
+      $('#btnUpload').disabled = !ok || busy || !!dropId;
+      for (const el of ['#fileInput', '#optOnce', '#optTtl', '#password', '#optRemember']) $(el).disabled = busy || !!dropId;
+    }
+
+    function addFiles(list) {
+      if (busy || dropId) return;
+      for (const file of list) picks.push({ id: nextId++, name: file.name, size: file.size, file, pct: 0, state: 'ready' });
+      $('#fileInput').value = '';
+      render();
+    }
+
+    function put(pick, target) {
+      return new Promise((resolve, reject) => {
+        const path = target.path.split('/').map(encodeURIComponent).join('/');
+        const x = new XMLHttpRequest();
+        x.open('PUT', `${SUPABASE_URL}/storage/v1/object/upload/sign/${BUCKET}/${path}?token=${encodeURIComponent(target.token)}`);
+        x.setRequestHeader('Content-Type', pick.file.type || 'application/octet-stream');
+        x.upload.onprogress = e => { if (e.lengthComputable) { pick.pct = e.loaded / e.total; render(); } };
+        x.onload = () => (x.status >= 200 && x.status < 300 ? resolve() : reject(new Error('HTTP ' + x.status)));
+        x.onerror = () => reject(new Error('網路錯誤'));
+        x.send(pick.file);
+      });
+    }
+
+    async function upload() {
+      const password = $('#password').value;
+      if (!password) { toast('請輸入上傳密碼', true); return; }
+      busy = true; render();
+      $('#upStatus').textContent = '準備中…';
+      let created = null;
+      try {
+        created = await api('create', {
+          password, ttlMinutes: +$('#optTtl').value, deleteAfter: $('#optOnce').checked,
+          files: picks.map(p => ({ name: p.name, size: p.size })),
+        });
+        try {
+          if ($('#optRemember').checked) localStorage.setItem(PW_KEY, password);
+          else localStorage.removeItem(PW_KEY);
+        } catch {}
+        let failed = 0;
+        for (const [i, p] of picks.entries()) {
+          $('#upStatus').textContent = `上傳中 ${i + 1} / ${picks.length}`;
+          p.state = 'uploading'; p.pct = 0; render();
+          try { await put(p, created.uploads[i]); p.state = 'done'; p.pct = 1; }
+          catch { p.state = 'error'; failed++; }
+          render();
+        }
+        await api('commit', { id: created.id });
+        dropId = created.id;
+        $('#shareUrl').value = location.origin + location.pathname + '#' + dropId;
+        $('#shareCard').classList.remove('hidden');
+        $('#shareStatus').textContent =
+          `${$('#optOnce').checked ? '對方下載後會自動刪除' : '可重複下載'}；沒人下載的話 ${fmtTime(created.expiresAt)} 自動刪除。`;
+        $('#upStatus').textContent = failed ? `${failed} 個檔案上傳失敗，其餘已可取件。` : '上傳完成。';
+      } catch (e) {
+        // 建立後才失敗的話，把伺服器上的半成品清掉
+        if (created) api('delete', { id: created.id }).catch(() => {});
+        for (const p of picks) { p.state = 'ready'; p.pct = 0; }
+        $('#upStatus').textContent = '';
+        toast(e.message, true);
+      } finally {
+        busy = false; render();
+      }
+    }
+
+    function reset() {
+      picks = []; dropId = null;
+      $('#shareUrl').value = '';
+      $('#shareCard').classList.add('hidden');
+      $('#upStatus').textContent = '';
+      render();
+    }
+
+    $('#fileInput').onchange = e => addFiles(e.target.files);
+    $('#btnUpload').onclick = upload;
+    $('#btnAgain').onclick = reset;
+    $('#btnRevoke').onclick = async () => {
+      if (!confirm('確定立即刪除這批檔案？取件連結會失效。')) return;
+      try { await api('delete', { id: dropId }); toast('已刪除，連結已失效'); reset(); }
+      catch (e) { toast(e.message, true); }
+    };
+    $('#btnCopy').onclick = async () => {
+      try { await navigator.clipboard.writeText($('#shareUrl').value); toast('連結已複製'); }
+      catch { $('#shareUrl').select(); toast('請手動複製連結', true); }
+    };
+    $('#sendList').addEventListener('click', e => {
+      if (!e.target.closest('[data-rm]')) return;
+      const id = +e.target.closest('.item').dataset.id;
+      picks = picks.filter(p => p.id !== id);
+      render();
+    });
+    const card = $('#pickCard');
+    for (const ev of ['dragenter', 'dragover']) card.addEventListener(ev, e => { e.preventDefault(); card.classList.add('over'); });
+    for (const ev of ['dragleave', 'drop']) card.addEventListener(ev, e => { e.preventDefault(); card.classList.remove('over'); });
+    card.addEventListener('drop', e => addFiles(e.dataTransfer.files));
+    window.addEventListener('beforeunload', e => { if (busy) e.preventDefault(); });
+    render();
+  }
+
+  // ================= 取件端 =================
+  function receiver(code) {
+    $('#recvView').classList.remove('hidden');
+    const canPickDir = typeof window.showDirectoryPicker === 'function';
+    $('#dlHint').textContent = canPickDir
+      ? '勾選多個檔案時會請你選一個本機資料夾，檔案逐一存進去，不會壓縮。'
+      : '這個瀏覽器會逐一下載勾選的檔案（不壓縮）。';
+    let items = [];             // { id, name, size, state: '' | loading | done | error, note }
+    const selected = new Set();
+    let busy = false;
+
+    function banner(msg) { $('#recvStatus').textContent = msg; $('#recvStatus').classList.toggle('hidden', !msg); }
+    const pickable = f => !f.state || f.state === 'error';
+
+    function render() {
+      $('#recvList').innerHTML = items.map(f => {
+        const lead = pickable(f)
+          ? `<input type="checkbox" data-sel ${selected.has(f.id) ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="選取 ${escapeHtml(f.name)}">`
+          : '';
+        return row(f, f.note || '', f.state === 'loading' ? f.pct : null, lead);
+      }).join('');
+      const n = selected.size;
+      const total = items.filter(pickable).length;
+      $('#btnDl').disabled = !n || busy;
+      $('#btnDl').textContent = n ? `下載所選（${n}）` : '下載所選';
+      $('#selAll').checked = n > 0 && n === total;
+      $('#selAll').indeterminate = n > 0 && n < total;
+      $('#selAll').disabled = busy || !total;
+    }
+
+    function saveBlob(blob, name) {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    }
+
+    // 邊下載邊回報進度；有選資料夾就直接寫進檔案，否則先收在記憶體再觸發下載
+    async function fetchOne(file, root) {
+      const { url } = await api('download', { id: code, fileId: file.id });
+      const res = await fetch(SUPABASE_URL + url);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const writer = root ? await (await root.getFileHandle(file.name, { create: true })).createWritable() : null;
+      const parts = [];
+      const reader = res.body.getReader();
+      let got = 0;
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (writer) await writer.write(value); else parts.push(value);
+          got += value.byteLength;
+          file.pct = file.size ? Math.min(1, got / file.size) : 1;
+          render();
+        }
+        if (writer) await writer.close();
+      } catch (e) {
+        if (writer) await writer.abort().catch(() => {});
+        throw e;
+      }
+      if (!writer) saveBlob(new Blob(parts), file.name);
+    }
+
+    async function download() {
+      const picks = items.filter(f => selected.has(f.id));
+      if (busy || !picks.length) return;
+      let root = null;
+      if (canPickDir && picks.length > 1) {
+        try { root = await window.showDirectoryPicker({ mode: 'readwrite' }); }
+        catch (e) { if (e.name === 'AbortError') return; }
+      }
+      busy = true;
+      let ok = 0;
+      for (const file of picks) {
+        selected.delete(file.id);
+        Object.assign(file, { state: 'loading', pct: 0, note: '下載中' });
+        render();
+        try {
+          await fetchOne(file, root);
+          ok++;
+          file.state = 'done';
+          file.note = '已下載';
+          // 存檔成功才通知伺服器刪除；通知失敗也不影響已下載的檔案，到期仍會自動清除
+          try { if ((await api('done', { id: code, fileId: file.id })).deleted) file.note = '已下載，伺服器上的檔案已刪除'; } catch {}
+          if (!root) await sleep(400);
+        } catch (e) {
+          file.state = 'error';
+          file.note = '失敗：' + e.message;
+        }
+        render();
+      }
+      busy = false;
+      toast(ok === picks.length ? `已下載 ${ok} 個檔案` : `${ok} 個完成，${picks.length - ok} 個失敗`, ok !== picks.length);
+      render();
+    }
+
+    async function load() {
+      try {
+        const data = await api('list', { id: code });
+        items = data.files.map(f => ({ ...f, state: '', note: '' }));
+        for (const f of items) selected.add(f.id);
+        banner(`${data.deleteAfter ? '下載後檔案會自動從伺服器刪除' : '可重複下載'}；保存到 ${fmtTime(data.expiresAt)}。`);
+      } catch (e) {
+        banner(e.message);
+      }
+      render();
+    }
+
+    $('#btnDl').onclick = download;
+    $('#selAll').onchange = e => {
+      selected.clear();
+      if (e.target.checked) for (const f of items) if (pickable(f)) selected.add(f.id);
+      render();
+    };
+    $('#recvList').addEventListener('click', e => {
+      if (!e.target.matches('[data-sel]')) return;
+      const id = e.target.closest('.item').dataset.id;
+      e.target.checked ? selected.add(id) : selected.delete(id);
+      render();
+    });
+    load();
+  }
+})();
+</script>
+</body>
+</html>

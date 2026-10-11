@@ -1,0 +1,13 @@
+# 每天呼叫一次後端：清除過期檔案，並避免 Supabase 免費專案因閒置被暫停
+name: keepalive
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -fsS -X POST "https://YOUR_PROJECT_REF.supabase.co/functions/v1/drop" \
+            -H "Content-Type: application/json" -d '{"action":"ping"}'
