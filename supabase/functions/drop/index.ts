@@ -6,6 +6,8 @@ const MAX_FILE = 50 * 1024 * 1024;
 const MAX_FILES = 50;
 const QUOTA = 900 * 1024 * 1024; // 免費版總容量 1GB，留一點餘裕
 const TTL_CHOICES = [60, 1440, 10080]; // 分鐘：1 小時、24 小時、7 天
+const FAIL_WINDOW_MIN = 15; // 同一 IP 在這段時間內密碼錯太多次就暫時鎖住
+const FAIL_MAX = 10;
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -51,6 +53,7 @@ async function cleanup() {
   const alive = new Set((must(await db.from("drops").select("id")) ?? []).map((d) => d.id));
   const folders = must(await db.storage.from(BUCKET).list("", { limit: 1000 })) ?? [];
   for (const f of folders) if (!alive.has(f.name)) await removeFolder(f.name);
+  must(await db.from("auth_failures").delete().lt("at", new Date(Date.now() - 86400000).toISOString()));
 }
 
 async function getDrop(id: unknown, needReady = true) {
@@ -75,20 +78,27 @@ async function removeFile(dropId: string, file: { id: string; path: string }) {
   const left = must(await db.from("drop_files").select("id").eq("drop_id", dropId).limit(1)) ?? [];
   if (!left.length) await removeDrop(dropId);
 }
-// 取件密碼或上傳密碼都可以看上傳紀錄、刪除其中的檔案
-async function checkViewer(password: unknown) {
+// 驗證密碼並回傳角色：上傳密碼可以上傳、看清單、刪除；取件密碼只能看清單、下載、刪除。
+// 同一 IP 短時間內錯太多次會被暫時鎖住，避免被人猜密碼
+async function checkPassword(ip: string, password: unknown, allowDownload: boolean): Promise<"upload" | "download"> {
+  const since = new Date(Date.now() - FAIL_WINDOW_MIN * 60000).toISOString();
+  const recent = await db.from("auth_failures").select("*", { count: "exact", head: true }).eq("ip", ip).gt("at", since);
+  if (recent.error) throw new Error(recent.error.message);
+  if ((recent.count ?? 0) >= FAIL_MAX) throw new Fail(429, `密碼錯誤次數過多，請 ${FAIL_WINDOW_MIN} 分鐘後再試`);
   const hash = await sha256(String(password ?? ""));
-  const keys = ["download_password_sha256", "upload_password_sha256"];
-  const cfg = must(await db.from("config").select("value").in("key", keys)) ?? [];
-  if (!cfg.some((c) => c.value === hash)) throw new Fail(401, "密碼不正確");
+  const keys = ["upload_password_sha256", "download_password_sha256"];
+  const cfg = must(await db.from("config").select("key, value").in("key", keys)) ?? [];
+  if (cfg.some((c) => c.key === keys[0] && c.value === hash)) return "upload";
+  if (allowDownload && cfg.some((c) => c.key === keys[1] && c.value === hash)) return "download";
+  must(await db.from("auth_failures").insert({ ip }));
+  throw new Fail(401, "密碼不正確");
 }
 
 // deno-lint-ignore no-explicit-any
-const actions: Record<string, (b: any) => Promise<unknown>> = {
+const actions: Record<string, (b: any, ip: string) => Promise<unknown>> = {
   // 上傳者：驗證密碼，建立取件碼，回傳每個檔案的一次性上傳憑證
-  async create(b) {
-    const cfg = must(await db.from("config").select("value").eq("key", "upload_password_sha256").maybeSingle());
-    if (!cfg || (await sha256(String(b.password ?? ""))) !== cfg.value) throw new Fail(401, "上傳密碼不正確");
+  async create(b, ip) {
+    await checkPassword(ip, b.password, false);
     const files = b.files;
     if (!Array.isArray(files) || !files.length || files.length > MAX_FILES) throw new Fail(400, `一次最多 ${MAX_FILES} 個檔案`);
     for (const f of files) {
@@ -141,8 +151,8 @@ const actions: Record<string, (b: any) => Promise<unknown>> = {
   },
 
   // 上傳紀錄：用取件密碼（或上傳密碼）列出所有還在的檔案
-  async browse(b) {
-    await checkViewer(b.password);
+  async browse(b, ip) {
+    const role = await checkPassword(ip, b.password, true);
     const drops = must(
       await db.from("drops")
         .select("id, note, delete_after_download, expires_at, created_at, drop_files(id, name, size)")
@@ -151,6 +161,7 @@ const actions: Record<string, (b: any) => Promise<unknown>> = {
         .order("created_at", { ascending: false }),
     ) ?? [];
     return {
+      role,
       drops: drops.map((d) => ({
         id: d.id, note: d.note, deleteAfter: d.delete_after_download, expiresAt: d.expires_at, createdAt: d.created_at,
         files: [...d.drop_files].sort((x, y) => x.name.localeCompare(y.name)),
@@ -176,8 +187,8 @@ const actions: Record<string, (b: any) => Promise<unknown>> = {
   },
 
   // 上傳紀錄裡手動刪除單一檔案：需要取件密碼或上傳密碼
-  async remove(b) {
-    await checkViewer(b.password);
+  async remove(b, ip) {
+    await checkPassword(ip, b.password, true);
     const drop = await getDrop(b.id);
     await removeFile(drop.id, await getFile(drop.id, b.fileId));
     return { deleted: true };
@@ -204,7 +215,8 @@ Deno.serve(async (req: Request) => {
     const body = await req.json().catch(() => ({}));
     const name = String(body?.action);
     if (!Object.hasOwn(actions, name)) return json({ error: "不支援的操作" }, 400);
-    return json(await actions[name](body));
+    const ip = (req.headers.get("x-forwarded-for") ?? "").split(",")[0].trim() || "unknown";
+    return json(await actions[name](body, ip));
   } catch (e) {
     if (e instanceof Fail) return json({ error: e.message }, e.status);
     console.error(e);

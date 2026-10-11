@@ -7,17 +7,30 @@
 <meta name="description" content="上傳檔案取得取件連結，對方下載後自動刪除。">
 <meta name="theme-color" content="#1c7ed6">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="style.css?v=4">
+<link rel="stylesheet" href="style.css?v=5">
 </head>
 <body>
 <header class="top">
   <div class="wrap">
     <div class="brand"><span class="dot"></span>QuickDrop <small>快速傳檔</small></div>
+    <div class="spacer"></div>
+    <button class="btn ghost hidden" id="btnLock" title="清除這台電腦記住的密碼並回到輸入畫面">鎖定</button>
   </div>
 </header>
 
 <main class="wrap">
   <div id="configBanner" class="banner hidden">尚未設定後端網址（index.html 裡的 <code>SUPABASE_URL</code>）。</div>
+
+  <!-- 一組密碼解鎖：上傳密碼開啟上傳與下載，取件密碼只開啟下載 -->
+  <section class="card hidden" id="unlockCard">
+    <h2>輸入密碼</h2>
+    <div class="row">
+      <input type="password" id="password" class="grow" placeholder="上傳密碼或取件密碼" autocomplete="off">
+      <label class="row" style="gap:6px"><input type="checkbox" id="optRemember" style="width:18px;height:18px"> 在這台電腦記住</label>
+      <button class="btn primary" id="btnUnlock">解鎖</button>
+    </div>
+    <p class="hint" style="margin:8px 0 0">上傳密碼可以上傳、下載和刪除；取件密碼可以下載和刪除。公用電腦請不要勾「記住」。</p>
+  </section>
 
   <!-- 上傳端 -->
   <section id="sendView" class="zone up hidden">
@@ -39,8 +52,6 @@
         <input type="text" id="note" class="grow" maxlength="100" placeholder="備註（選填），會顯示在上傳紀錄，例如：10 月週會簡報">
       </div>
       <div class="row" style="margin-top:12px">
-        <input type="password" id="password" class="grow" placeholder="上傳密碼" autocomplete="off">
-        <label class="row" style="gap:6px"><input type="checkbox" id="optRemember" style="width:18px;height:18px"> 在這台電腦記住</label>
         <button class="btn primary" id="btnUpload" disabled>上傳並建立取件連結</button>
       </div>
       <p class="hint" id="upStatus" style="margin:8px 0 0"></p>
@@ -63,12 +74,7 @@
   <!-- 下載端：取件連結與上傳紀錄共用同一份檔案清單 -->
   <section id="downView" class="zone down hidden">
     <h2 class="zone-title">⬇ 下載</h2>
-    <div class="row" id="browseLogin">
-        <input type="password" id="browsePw" class="grow" placeholder="取件密碼" autocomplete="off">
-        <label class="row" style="gap:6px"><input type="checkbox" id="browseRemember" style="width:18px;height:18px"> 在這台電腦記住</label>
-        <button class="btn" id="btnBrowse">查看</button>
-      </div>
-    <p class="hint" id="browseHint" style="margin:8px 0 0">輸入取件密碼，列出目前還在伺服器上的所有檔案，可以下載或刪除。</p>
+    <p class="hint hidden" id="browseHint" style="margin:0"></p>
 
   <div id="recvView" class="hidden">
     <div class="banner" id="recvStatus">讀取中…</div>
@@ -78,6 +84,13 @@
       <button class="btn ghost" id="btnRefresh" title="重新整理">↻</button>
       <button class="btn danger hidden" id="btnDel" disabled>刪除所選</button>
       <button class="btn primary" id="btnDl" disabled>下載所選</button>
+    </div>
+    <div class="banner hidden" id="dlConfirm">
+      <span id="dlConfirmText"></span>
+      <div class="row" style="margin-top:8px">
+        <button class="btn primary small" id="btnDlYes">確認下載</button>
+        <button class="btn small" id="btnDlNo">取消</button>
+      </div>
     </div>
     <p class="hint" id="dlHint" style="margin:6px 0 0"></p>
     <div class="list" id="recvList"></div>
@@ -95,7 +108,6 @@
   const BUCKET = 'drops';
   const MAX_FILE = 50 * 1024 * 1024;
   const PW_KEY = 'quickdrop.password';
-  const BROWSE_KEY = 'quickdrop.browsePassword';
 
   const $ = s => document.querySelector(s);
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -148,8 +160,6 @@
   if (!SUPABASE_URL) $('#configBanner').classList.remove('hidden');
   else if (code) {
     $('#downView').classList.remove('hidden');
-    $('#browseLogin').classList.add('hidden');
-    $('#browseHint').classList.add('hidden');
     fileList(async () => {
       const data = await api('list', { id: code });
       return {
@@ -157,20 +167,58 @@
         groups: [{ id: code, title: '', files: data.files }],
       };
     }, { selectAll: true }).reload();
-  } else sender(browse());
+  } else unlock();
+
+  // ================= 解鎖 =================
+  // 輸入一次密碼：依後端回報的角色決定開啟哪些區塊
+  function unlock() {
+    $('#unlockCard').classList.remove('hidden');
+    try { localStorage.removeItem('quickdrop.browsePassword'); } catch {}
+    let busy = false;
+
+    async function open() {
+      const password = $('#password').value;
+      if (busy) return;
+      if (!password) { toast('請輸入密碼', true); return; }
+      busy = true;
+      $('#btnUnlock').disabled = true;
+      try {
+        const first = await api('browse', { password });
+        try {
+          if ($('#optRemember').checked) localStorage.setItem(PW_KEY, password);
+          else localStorage.removeItem(PW_KEY);
+        } catch {}
+        $('#unlockCard').classList.add('hidden');
+        $('#btnLock').classList.remove('hidden');
+        const records = browse(password, first);
+        if (first.role === 'upload') sender(password, records);
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        busy = false;
+        $('#btnUnlock').disabled = false;
+      }
+    }
+
+    $('#btnUnlock').onclick = open;
+    $('#password').addEventListener('keydown', e => { if (e.key === 'Enter') open(); });
+    $('#btnLock').onclick = () => {
+      try { localStorage.removeItem(PW_KEY); } catch {}
+      location.reload();
+    };
+    try {
+      const saved = localStorage.getItem(PW_KEY);
+      if (saved) { $('#password').value = saved; $('#optRemember').checked = true; open(); }
+    } catch {}
+  }
 
   // ================= 上傳端 =================
-  function sender(records) {
+  function sender(password, records) {
     $('#sendView').classList.remove('hidden');
     let picks = [];       // { id, name, size, file, pct, state: ready | uploading | done | error }
     let nextId = 1;
     let busy = false;
     let dropId = null;
-
-    try {
-      const saved = localStorage.getItem(PW_KEY);
-      if (saved) { $('#password').value = saved; $('#optRemember').checked = true; }
-    } catch {}
 
     function render() {
       const text = { uploading: '上傳中', done: '已上傳', error: '上傳失敗' };
@@ -180,7 +228,7 @@
         p.state === 'done' ? 'done' : p.state === 'error' ? 'error' : '')).join('');
       const ok = picks.length && picks.every(p => p.size <= MAX_FILE);
       $('#btnUpload').disabled = !ok || busy || !!dropId;
-      for (const el of ['#fileInput', '#optOnce', '#optTtl', '#note', '#password', '#optRemember']) $(el).disabled = busy || !!dropId;
+      for (const el of ['#fileInput', '#optOnce', '#optTtl', '#note']) $(el).disabled = busy || !!dropId;
     }
 
     function addFiles(list) {
@@ -204,8 +252,6 @@
     }
 
     async function upload() {
-      const password = $('#password').value;
-      if (!password) { toast('請輸入上傳密碼', true); return; }
       busy = true; render();
       $('#upStatus').textContent = '準備中…';
       let created = null;
@@ -214,10 +260,6 @@
           password, ttlMinutes: +$('#optTtl').value, deleteAfter: $('#optOnce').checked, note: $('#note').value,
           files: picks.map(p => ({ name: p.name, size: p.size })),
         });
-        try {
-          if ($('#optRemember').checked) localStorage.setItem(PW_KEY, password);
-          else localStorage.removeItem(PW_KEY);
-        } catch {}
         let failed = 0;
         for (const [i, p] of picks.entries()) {
           $('#upStatus').textContent = `上傳中 ${i + 1} / ${picks.length}`;
@@ -281,46 +323,33 @@
   }
 
   // ================= 上傳紀錄 =================
-  // 用取件密碼列出所有還在伺服器上的檔案；回傳 refresh() 讓上傳端在有變動時更新清單
-  function browse() {
+  // 列出所有還在伺服器上的檔案；回傳 refresh() 讓上傳端在有變動時更新清單
+  function browse(password, first) {
     $('#downView').classList.remove('hidden');
-    let password = '';
-    let list = null;
-    const open = () => {
-      password = $('#browsePw').value;
-      if (!password) { toast('請輸入取件密碼', true); return; }
-      list = list || fileList(async () => {
-        const data = await api('browse', { password });
-        try {
-          if ($('#browseRemember').checked) localStorage.setItem(BROWSE_KEY, password);
-          else localStorage.removeItem(BROWSE_KEY);
-        } catch {}
-        $('#browseLogin').classList.add('hidden');
-        $('#browseHint').textContent = data.drops.length ? '以下是目前還在伺服器上的檔案，勾選後可以下載或刪除。' : '目前沒有任何檔案。';
-        return {
-          banner: '',
-          groups: data.drops.map(d => ({
-            id: d.id, files: d.files,
-            title: [d.note || '（無備註）', fmtTime(d.createdAt) + ' 上傳', '保存到 ' + fmtTime(d.expiresAt), d.deleteAfter ? '下載後刪除' : '可重複下載'].join('・'),
-          })),
-        };
-      }, { removePassword: () => password });
-      list.reload();
-    };
-    $('#btnBrowse').onclick = open;
-    $('#browsePw').addEventListener('keydown', e => { if (e.key === 'Enter') open(); });
-    try {
-      const saved = localStorage.getItem(BROWSE_KEY);
-      if (saved) { $('#browsePw').value = saved; $('#browseRemember').checked = true; open(); }
-    } catch {}
-    return { refresh: () => { if (list) list.reload(); } };
+    $('#browseHint').classList.remove('hidden');
+    let cached = first;   // 解鎖時已經查過一次，第一次顯示直接用，不重複呼叫
+    const list = fileList(async () => {
+      const data = cached || await api('browse', { password });
+      cached = null;
+      $('#browseHint').textContent = data.drops.length ? '以下是目前還在伺服器上的檔案，勾選後可以下載或刪除。' : '目前沒有任何檔案。';
+      return {
+        banner: '',
+        groups: data.drops.map(d => ({
+          id: d.id, files: d.files, deleteAfter: d.deleteAfter,
+          title: [d.note || '（無備註）', fmtTime(d.createdAt) + ' 上傳', '保存到 ' + fmtTime(d.expiresAt), d.deleteAfter ? '下載後刪除' : '可重複下載'].join('・'),
+        })),
+      };
+    }, { removePassword: () => password, shareLinks: true, warnDelete: true });
+    list.reload();
+    return { refresh: () => list.reload() };
   }
 
   // ================= 檔案清單（取件連結與上傳紀錄共用）=================
   // load() 回傳 { banner, groups: [{ id, title, files }] }；id 是該批檔案的取件碼
-  // opts.selectAll：載入後預設全選；opts.removePassword：有提供才顯示「刪除所選」
+  // opts.selectAll：載入後預設全選；opts.removePassword：有提供才顯示「刪除所選」；
+  // opts.shareLinks：每批顯示「複製取件連結」；opts.warnDelete：下載會刪除檔案時先請使用者確認
   function fileList(load, opts) {
-    const { selectAll, removePassword } = opts;
+    const { selectAll, removePassword, shareLinks, warnDelete } = opts;
     $('#btnDel').classList.toggle('hidden', !removePassword);
     $('#recvView').classList.remove('hidden');
     const canPickDir = typeof window.showDirectoryPicker === 'function';
@@ -337,7 +366,7 @@
 
     function render() {
       $('#recvList').innerHTML = groups.map(g =>
-        (g.title ? `<div class="group">${escapeHtml(g.title)}</div>` : '') +
+        (g.title ? `<div class="group"><span>${escapeHtml(g.title)}</span>${shareLinks ? `<button class="btn ghost small" data-link="${escapeHtml(g.id)}">複製取件連結</button>` : ''}</div>` : '') +
         items.filter(f => f.dropId === g.id).map(f => {
           const lead = pickable(f)
             ? `<input type="checkbox" data-sel ${selected.has(f.id) ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="選取 ${escapeHtml(f.name)}">`
@@ -353,6 +382,7 @@
       $('#selAll').disabled = busy || !total;
       $('#btnRefresh').disabled = busy;
       $('#btnDel').disabled = !n || busy;
+      if (!n || busy) $('#dlConfirm').classList.add('hidden');
     }
 
     function saveBlob(blob, name) {
@@ -436,6 +466,15 @@
       render();
     }
 
+    // 多人共用的清單裡，「下載後刪除」的檔案被下載就會消失，所以先在頁面上確認。
+    // 用頁面上的按鈕而不是 confirm()，確認後的那一下點擊才能接著開啟資料夾選擇視窗
+    function askDownload() {
+      const risky = warnDelete ? items.filter(f => selected.has(f.id) && f.deleteAfter).length : 0;
+      if (!risky) { download(); return; }
+      $('#dlConfirmText').textContent = `選取的檔案中有 ${risky} 個設定為「下載後刪除」：下載完成後會從伺服器移除，其他人將無法再下載。`;
+      $('#dlConfirm').classList.remove('hidden');
+    }
+
     async function removeSelected() {
       const picks = items.filter(f => selected.has(f.id));
       if (busy || !picks.length) return;
@@ -456,7 +495,7 @@
       try {
         const data = await load();
         groups = data.groups;
-        items = groups.flatMap(g => g.files.map(f => ({ ...f, dropId: g.id, state: '', note: '' })));
+        items = groups.flatMap(g => g.files.map(f => ({ ...f, dropId: g.id, deleteAfter: !!g.deleteAfter, state: '', note: '' })));
         selected.clear();
         if (selectAll) for (const f of items) selected.add(f.id);
         banner(data.banner);
@@ -467,7 +506,9 @@
       render();
     }
 
-    $('#btnDl').onclick = download;
+    $('#btnDl').onclick = askDownload;
+    $('#btnDlYes').onclick = () => { $('#dlConfirm').classList.add('hidden'); download(); };
+    $('#btnDlNo').onclick = () => $('#dlConfirm').classList.add('hidden');
     $('#btnRefresh').onclick = reload;
     $('#btnDel').onclick = removeSelected;
     $('#selAll').onchange = e => {
@@ -475,10 +516,18 @@
       if (e.target.checked) for (const f of items) if (pickable(f)) selected.add(f.id);
       render();
     };
-    $('#recvList').addEventListener('click', e => {
+    $('#recvList').addEventListener('click', async e => {
+      const link = e.target.closest('[data-link]');
+      if (link) {
+        const url = location.origin + location.pathname + '#' + link.dataset.link;
+        try { await navigator.clipboard.writeText(url); toast('取件連結已複製'); }
+        catch { prompt('複製這個取件連結：', url); }
+        return;
+      }
       if (!e.target.matches('[data-sel]')) return;
       const id = e.target.closest('.item').dataset.id;
       e.target.checked ? selected.add(id) : selected.delete(id);
+      $('#dlConfirm').classList.add('hidden');
       render();
     });
     return { reload };

@@ -127,7 +127,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin:
 
 a.btn { text-decoration: none; }
 .drop.over { outline: 2px dashed var(--accent); outline-offset: -6px; }
-.group { margin-top: 14px; font-size: 13px; color: var(--muted); }
+.group { margin-top: 14px; font-size: 13px; color: var(--muted); display: flex; gap: 8px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
 
 /* 上傳、下載兩大區塊用不同底色區分 */
 .zone { border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 16px; margin-top: 16px; }
