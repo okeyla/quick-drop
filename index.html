@@ -7,7 +7,7 @@
 <meta name="description" content="上傳檔案取得取件連結，對方下載後自動刪除。">
 <meta name="theme-color" content="#1c7ed6">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="style.css?v=3">
+<link rel="stylesheet" href="style.css?v=4">
 </head>
 <body>
 <header class="top">
@@ -20,9 +20,9 @@
   <div id="configBanner" class="banner hidden">尚未設定後端網址（index.html 裡的 <code>SUPABASE_URL</code>）。</div>
 
   <!-- 上傳端 -->
-  <div id="sendView" class="hidden">
-    <section class="card drop" id="pickCard">
-      <h2>傳送檔案</h2>
+  <section id="sendView" class="zone up hidden">
+    <h2 class="zone-title">⬆ 上傳</h2>
+    <div class="drop" id="pickCard">
       <input type="file" id="fileInput" multiple>
       <p class="hint" style="margin:8px 0 0">也可以把檔案拖曳到這裡。單檔上限 50 MB。</p>
       <div class="list" id="sendList"></div>
@@ -44,7 +44,7 @@
         <button class="btn primary" id="btnUpload" disabled>上傳並建立取件連結</button>
       </div>
       <p class="hint" id="upStatus" style="margin:8px 0 0"></p>
-    </section>
+    </div>
 
     <section class="card hidden" id="shareCard">
       <h2>取件連結</h2>
@@ -58,30 +58,31 @@
         <button class="btn danger" id="btnRevoke">立即刪除這批檔案</button>
       </div>
     </section>
+  </section>
 
-    <section class="card" id="browseCard">
-      <h2>上傳紀錄</h2>
-      <div class="row" id="browseLogin">
+  <!-- 下載端：取件連結與上傳紀錄共用同一份檔案清單 -->
+  <section id="downView" class="zone down hidden">
+    <h2 class="zone-title">⬇ 下載</h2>
+    <div class="row" id="browseLogin">
         <input type="password" id="browsePw" class="grow" placeholder="取件密碼" autocomplete="off">
         <label class="row" style="gap:6px"><input type="checkbox" id="browseRemember" style="width:18px;height:18px"> 在這台電腦記住</label>
         <button class="btn" id="btnBrowse">查看</button>
       </div>
-      <p class="hint" id="browseHint" style="margin:8px 0 0">輸入取件密碼，列出目前還在伺服器上的所有檔案。</p>
-    </section>
-  </div>
+    <p class="hint" id="browseHint" style="margin:8px 0 0">輸入取件密碼，列出目前還在伺服器上的所有檔案，可以下載或刪除。</p>
 
-  <!-- 檔案清單：取件連結與上傳紀錄共用 -->
   <div id="recvView" class="hidden">
     <div class="banner" id="recvStatus">讀取中…</div>
     <div class="row" style="margin-top:16px">
       <label class="row" style="gap:6px"><input type="checkbox" id="selAll" style="width:18px;height:18px"> 全選</label>
       <div class="spacer"></div>
       <button class="btn ghost" id="btnRefresh" title="重新整理">↻</button>
+      <button class="btn danger hidden" id="btnDel" disabled>刪除所選</button>
       <button class="btn primary" id="btnDl" disabled>下載所選</button>
     </div>
     <p class="hint" id="dlHint" style="margin:6px 0 0"></p>
     <div class="list" id="recvList"></div>
   </div>
+  </section>
 </main>
 
 <div class="toast" id="toast"></div>
@@ -146,13 +147,16 @@
   const code = location.hash.slice(1);
   if (!SUPABASE_URL) $('#configBanner').classList.remove('hidden');
   else if (code) {
+    $('#downView').classList.remove('hidden');
+    $('#browseLogin').classList.add('hidden');
+    $('#browseHint').classList.add('hidden');
     fileList(async () => {
       const data = await api('list', { id: code });
       return {
         banner: `${data.deleteAfter ? '下載後檔案會自動從伺服器刪除' : '可重複下載'}；保存到 ${fmtTime(data.expiresAt)}。`,
         groups: [{ id: code, title: '', files: data.files }],
       };
-    }, true).reload();
+    }, { selectAll: true }).reload();
   } else sender(browse());
 
   // ================= 上傳端 =================
@@ -279,6 +283,7 @@
   // ================= 上傳紀錄 =================
   // 用取件密碼列出所有還在伺服器上的檔案；回傳 refresh() 讓上傳端在有變動時更新清單
   function browse() {
+    $('#downView').classList.remove('hidden');
     let password = '';
     let list = null;
     const open = () => {
@@ -291,7 +296,7 @@
           else localStorage.removeItem(BROWSE_KEY);
         } catch {}
         $('#browseLogin').classList.add('hidden');
-        $('#browseHint').textContent = data.drops.length ? '以下是目前還在伺服器上的檔案，勾選後下載。' : '目前沒有任何檔案。';
+        $('#browseHint').textContent = data.drops.length ? '以下是目前還在伺服器上的檔案，勾選後可以下載或刪除。' : '目前沒有任何檔案。';
         return {
           banner: '',
           groups: data.drops.map(d => ({
@@ -299,7 +304,7 @@
             title: [d.note || '（無備註）', fmtTime(d.createdAt) + ' 上傳', '保存到 ' + fmtTime(d.expiresAt), d.deleteAfter ? '下載後刪除' : '可重複下載'].join('・'),
           })),
         };
-      }, false);
+      }, { removePassword: () => password });
       list.reload();
     };
     $('#btnBrowse').onclick = open;
@@ -313,7 +318,10 @@
 
   // ================= 檔案清單（取件連結與上傳紀錄共用）=================
   // load() 回傳 { banner, groups: [{ id, title, files }] }；id 是該批檔案的取件碼
-  function fileList(load, selectAll) {
+  // opts.selectAll：載入後預設全選；opts.removePassword：有提供才顯示「刪除所選」
+  function fileList(load, opts) {
+    const { selectAll, removePassword } = opts;
+    $('#btnDel').classList.toggle('hidden', !removePassword);
     $('#recvView').classList.remove('hidden');
     const canPickDir = typeof window.showDirectoryPicker === 'function';
     $('#dlHint').textContent = canPickDir
@@ -344,6 +352,7 @@
       $('#selAll').indeterminate = n > 0 && n < total;
       $('#selAll').disabled = busy || !total;
       $('#btnRefresh').disabled = busy;
+      $('#btnDel').disabled = !n || busy;
     }
 
     function saveBlob(blob, name) {
@@ -427,6 +436,21 @@
       render();
     }
 
+    async function removeSelected() {
+      const picks = items.filter(f => selected.has(f.id));
+      if (busy || !picks.length) return;
+      if (!confirm(`確定從伺服器刪除這 ${picks.length} 個檔案？刪除後無法復原。`)) return;
+      busy = true; render();
+      let ok = 0, lastError = '';
+      for (const file of picks) {
+        try { await api('remove', { password: removePassword(), id: file.dropId, fileId: file.id }); ok++; }
+        catch (e) { lastError = e.message; }
+      }
+      busy = false;
+      toast(ok === picks.length ? `已刪除 ${ok} 個檔案` : `${ok} 個已刪除，${picks.length - ok} 個失敗：${lastError}`, ok !== picks.length);
+      await reload();
+    }
+
     async function reload() {
       if (busy) return;
       try {
@@ -445,6 +469,7 @@
 
     $('#btnDl').onclick = download;
     $('#btnRefresh').onclick = reload;
+    $('#btnDel').onclick = removeSelected;
     $('#selAll').onchange = e => {
       selected.clear();
       if (e.target.checked) for (const f of items) if (pickable(f)) selected.add(f.id);

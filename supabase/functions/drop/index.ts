@@ -68,6 +68,21 @@ async function getFile(dropId: string, fileId: unknown) {
   return file;
 }
 
+// 刪掉一個檔案；整批都沒檔案時連取件碼一起移除
+async function removeFile(dropId: string, file: { id: string; path: string }) {
+  must(await db.storage.from(BUCKET).remove([file.path]));
+  must(await db.from("drop_files").delete().eq("id", file.id));
+  const left = must(await db.from("drop_files").select("id").eq("drop_id", dropId).limit(1)) ?? [];
+  if (!left.length) await removeDrop(dropId);
+}
+// 取件密碼或上傳密碼都可以看上傳紀錄、刪除其中的檔案
+async function checkViewer(password: unknown) {
+  const hash = await sha256(String(password ?? ""));
+  const keys = ["download_password_sha256", "upload_password_sha256"];
+  const cfg = must(await db.from("config").select("value").in("key", keys)) ?? [];
+  if (!cfg.some((c) => c.value === hash)) throw new Fail(401, "密碼不正確");
+}
+
 // deno-lint-ignore no-explicit-any
 const actions: Record<string, (b: any) => Promise<unknown>> = {
   // 上傳者：驗證密碼，建立取件碼，回傳每個檔案的一次性上傳憑證
@@ -127,10 +142,7 @@ const actions: Record<string, (b: any) => Promise<unknown>> = {
 
   // 上傳紀錄：用取件密碼（或上傳密碼）列出所有還在的檔案
   async browse(b) {
-    const hash = await sha256(String(b.password ?? ""));
-    const keys = ["download_password_sha256", "upload_password_sha256"];
-    const cfg = must(await db.from("config").select("value").in("key", keys)) ?? [];
-    if (!cfg.some((c) => c.value === hash)) throw new Fail(401, "密碼不正確");
+    await checkViewer(b.password);
     const drops = must(
       await db.from("drops")
         .select("id, note, delete_after_download, expires_at, created_at, drop_files(id, name, size)")
@@ -159,11 +171,15 @@ const actions: Record<string, (b: any) => Promise<unknown>> = {
   async done(b) {
     const drop = await getDrop(b.id);
     if (!drop.delete_after_download) return { deleted: false };
-    const file = await getFile(drop.id, b.fileId);
-    must(await db.storage.from(BUCKET).remove([file.path]));
-    must(await db.from("drop_files").delete().eq("id", file.id));
-    const left = must(await db.from("drop_files").select("id").eq("drop_id", drop.id).limit(1)) ?? [];
-    if (!left.length) await removeDrop(drop.id);
+    await removeFile(drop.id, await getFile(drop.id, b.fileId));
+    return { deleted: true };
+  },
+
+  // 上傳紀錄裡手動刪除單一檔案：需要取件密碼或上傳密碼
+  async remove(b) {
+    await checkViewer(b.password);
+    const drop = await getDrop(b.id);
+    await removeFile(drop.id, await getFile(drop.id, b.fileId));
     return { deleted: true };
   },
 

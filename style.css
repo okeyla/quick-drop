@@ -128,3 +128,13 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin:
 a.btn { text-decoration: none; }
 .drop.over { outline: 2px dashed var(--accent); outline-offset: -6px; }
 .group { margin-top: 14px; font-size: 13px; color: var(--muted); }
+
+/* 上傳、下載兩大區塊用不同底色區分 */
+.zone { border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 16px; margin-top: 16px; }
+.zone-title { margin: 0 0 12px; font-size: 16px; }
+.zone.up { background: color-mix(in srgb, var(--accent) 9%, var(--surface)); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+.zone.up .zone-title { color: color-mix(in srgb, var(--accent) 75%, var(--text)); }
+.zone.down { background: color-mix(in srgb, var(--ok) 9%, var(--surface)); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
+.zone.down .zone-title { color: color-mix(in srgb, var(--ok) 75%, var(--text)); }
+.zone.down .btn.primary { background: var(--ok); border-color: var(--ok); color: #fff; }
+.zone.down .item input[type=checkbox], .zone.down #selAll { accent-color: var(--ok); }
