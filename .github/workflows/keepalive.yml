@@ -9,5 +9,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: |
-          curl -fsS -X POST "https://YOUR_PROJECT_REF.supabase.co/functions/v1/drop" \
+          curl -fsS -X POST "https://waedocvudiyxtlywtzqq.supabase.co/functions/v1/drop" \
             -H "Content-Type: application/json" -d '{"action":"ping"}'
