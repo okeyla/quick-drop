@@ -127,3 +127,4 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin:
 
 a.btn { text-decoration: none; }
 .drop.over { outline: 2px dashed var(--accent); outline-offset: -6px; }
+.group { margin-top: 14px; font-size: 13px; color: var(--muted); }

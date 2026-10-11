@@ -90,7 +90,8 @@ const actions: Record<string, (b: any) => Promise<unknown>> = {
 
     const id = newId();
     const expiresAt = new Date(Date.now() + b.ttlMinutes * 60000).toISOString();
-    must(await db.from("drops").insert({ id, delete_after_download: b.deleteAfter !== false, expires_at: expiresAt }));
+    const note = typeof b.note === "string" ? b.note.trim().slice(0, 100) : "";
+    must(await db.from("drops").insert({ id, note, delete_after_download: b.deleteAfter !== false, expires_at: expiresAt }));
     // 逐筆建立，確保回傳的順序和網頁送來的檔案順序一致
     const uploads = [];
     for (const f of files) {
@@ -122,6 +123,27 @@ const actions: Record<string, (b: any) => Promise<unknown>> = {
     const drop = await getDrop(b.id);
     const files = must(await db.from("drop_files").select("id, name, size").eq("drop_id", drop.id).order("name")) ?? [];
     return { deleteAfter: drop.delete_after_download, expiresAt: drop.expires_at, files };
+  },
+
+  // 上傳紀錄：用取件密碼（或上傳密碼）列出所有還在的檔案
+  async browse(b) {
+    const hash = await sha256(String(b.password ?? ""));
+    const keys = ["download_password_sha256", "upload_password_sha256"];
+    const cfg = must(await db.from("config").select("value").in("key", keys)) ?? [];
+    if (!cfg.some((c) => c.value === hash)) throw new Fail(401, "密碼不正確");
+    const drops = must(
+      await db.from("drops")
+        .select("id, note, delete_after_download, expires_at, created_at, drop_files(id, name, size)")
+        .eq("ready", true)
+        .gt("expires_at", new Date().toISOString())
+        .order("created_at", { ascending: false }),
+    ) ?? [];
+    return {
+      drops: drops.map((d) => ({
+        id: d.id, note: d.note, deleteAfter: d.delete_after_download, expiresAt: d.expires_at, createdAt: d.created_at,
+        files: [...d.drop_files].sort((x, y) => x.name.localeCompare(y.name)),
+      })),
+    };
   },
 
   async download(b) {

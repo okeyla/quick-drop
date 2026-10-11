@@ -7,7 +7,7 @@
 <meta name="description" content="上傳檔案取得取件連結，對方下載後自動刪除。">
 <meta name="theme-color" content="#1c7ed6">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="style.css?v=2">
+<link rel="stylesheet" href="style.css?v=3">
 </head>
 <body>
 <header class="top">
@@ -36,6 +36,9 @@
         </select>
       </div>
       <div class="row" style="margin-top:12px">
+        <input type="text" id="note" class="grow" maxlength="100" placeholder="備註（選填），會顯示在上傳紀錄，例如：10 月週會簡報">
+      </div>
+      <div class="row" style="margin-top:12px">
         <input type="password" id="password" class="grow" placeholder="上傳密碼" autocomplete="off">
         <label class="row" style="gap:6px"><input type="checkbox" id="optRemember" style="width:18px;height:18px"> 在這台電腦記住</label>
         <button class="btn primary" id="btnUpload" disabled>上傳並建立取件連結</button>
@@ -55,14 +58,25 @@
         <button class="btn danger" id="btnRevoke">立即刪除這批檔案</button>
       </div>
     </section>
+
+    <section class="card" id="browseCard">
+      <h2>上傳紀錄</h2>
+      <div class="row" id="browseLogin">
+        <input type="password" id="browsePw" class="grow" placeholder="取件密碼" autocomplete="off">
+        <label class="row" style="gap:6px"><input type="checkbox" id="browseRemember" style="width:18px;height:18px"> 在這台電腦記住</label>
+        <button class="btn" id="btnBrowse">查看</button>
+      </div>
+      <p class="hint" id="browseHint" style="margin:8px 0 0">輸入取件密碼，列出目前還在伺服器上的所有檔案。</p>
+    </section>
   </div>
 
-  <!-- 取件端 -->
+  <!-- 檔案清單：取件連結與上傳紀錄共用 -->
   <div id="recvView" class="hidden">
     <div class="banner" id="recvStatus">讀取中…</div>
     <div class="row" style="margin-top:16px">
       <label class="row" style="gap:6px"><input type="checkbox" id="selAll" style="width:18px;height:18px"> 全選</label>
       <div class="spacer"></div>
+      <button class="btn ghost" id="btnRefresh" title="重新整理">↻</button>
       <button class="btn primary" id="btnDl" disabled>下載所選</button>
     </div>
     <p class="hint" id="dlHint" style="margin:6px 0 0"></p>
@@ -80,6 +94,7 @@
   const BUCKET = 'drops';
   const MAX_FILE = 50 * 1024 * 1024;
   const PW_KEY = 'quickdrop.password';
+  const BROWSE_KEY = 'quickdrop.browsePassword';
 
   const $ = s => document.querySelector(s);
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -130,11 +145,18 @@
 
   const code = location.hash.slice(1);
   if (!SUPABASE_URL) $('#configBanner').classList.remove('hidden');
-  else if (code) receiver(code);
-  else sender();
+  else if (code) {
+    fileList(async () => {
+      const data = await api('list', { id: code });
+      return {
+        banner: `${data.deleteAfter ? '下載後檔案會自動從伺服器刪除' : '可重複下載'}；保存到 ${fmtTime(data.expiresAt)}。`,
+        groups: [{ id: code, title: '', files: data.files }],
+      };
+    }, true).reload();
+  } else sender(browse());
 
   // ================= 上傳端 =================
-  function sender() {
+  function sender(records) {
     $('#sendView').classList.remove('hidden');
     let picks = [];       // { id, name, size, file, pct, state: ready | uploading | done | error }
     let nextId = 1;
@@ -154,7 +176,7 @@
         p.state === 'done' ? 'done' : p.state === 'error' ? 'error' : '')).join('');
       const ok = picks.length && picks.every(p => p.size <= MAX_FILE);
       $('#btnUpload').disabled = !ok || busy || !!dropId;
-      for (const el of ['#fileInput', '#optOnce', '#optTtl', '#password', '#optRemember']) $(el).disabled = busy || !!dropId;
+      for (const el of ['#fileInput', '#optOnce', '#optTtl', '#note', '#password', '#optRemember']) $(el).disabled = busy || !!dropId;
     }
 
     function addFiles(list) {
@@ -185,7 +207,7 @@
       let created = null;
       try {
         created = await api('create', {
-          password, ttlMinutes: +$('#optTtl').value, deleteAfter: $('#optOnce').checked,
+          password, ttlMinutes: +$('#optTtl').value, deleteAfter: $('#optOnce').checked, note: $('#note').value,
           files: picks.map(p => ({ name: p.name, size: p.size })),
         });
         try {
@@ -207,6 +229,7 @@
         $('#shareStatus').textContent =
           `${$('#optOnce').checked ? '對方下載後會自動刪除' : '可重複下載'}；沒人下載的話 ${fmtTime(created.expiresAt)} 自動刪除。`;
         $('#upStatus').textContent = failed ? `${failed} 個檔案上傳失敗，其餘已可取件。` : '上傳完成。';
+        records.refresh();
       } catch (e) {
         // 建立後才失敗的話，把伺服器上的半成品清掉
         if (created) api('delete', { id: created.id }).catch(() => {});
@@ -223,6 +246,7 @@
       $('#shareUrl').value = '';
       $('#shareCard').classList.add('hidden');
       $('#upStatus').textContent = '';
+      $('#note').value = '';
       render();
     }
 
@@ -231,7 +255,7 @@
     $('#btnAgain').onclick = reset;
     $('#btnRevoke').onclick = async () => {
       if (!confirm('確定立即刪除這批檔案？取件連結會失效。')) return;
-      try { await api('delete', { id: dropId }); toast('已刪除，連結已失效'); reset(); }
+      try { await api('delete', { id: dropId }); toast('已刪除，連結已失效'); reset(); records.refresh(); }
       catch (e) { toast(e.message, true); }
     };
     $('#btnCopy').onclick = async () => {
@@ -252,14 +276,51 @@
     render();
   }
 
-  // ================= 取件端 =================
-  function receiver(code) {
+  // ================= 上傳紀錄 =================
+  // 用取件密碼列出所有還在伺服器上的檔案；回傳 refresh() 讓上傳端在有變動時更新清單
+  function browse() {
+    let password = '';
+    let list = null;
+    const open = () => {
+      password = $('#browsePw').value;
+      if (!password) { toast('請輸入取件密碼', true); return; }
+      list = list || fileList(async () => {
+        const data = await api('browse', { password });
+        try {
+          if ($('#browseRemember').checked) localStorage.setItem(BROWSE_KEY, password);
+          else localStorage.removeItem(BROWSE_KEY);
+        } catch {}
+        $('#browseLogin').classList.add('hidden');
+        $('#browseHint').textContent = data.drops.length ? '以下是目前還在伺服器上的檔案，勾選後下載。' : '目前沒有任何檔案。';
+        return {
+          banner: '',
+          groups: data.drops.map(d => ({
+            id: d.id, files: d.files,
+            title: [d.note || '（無備註）', fmtTime(d.createdAt) + ' 上傳', '保存到 ' + fmtTime(d.expiresAt), d.deleteAfter ? '下載後刪除' : '可重複下載'].join('・'),
+          })),
+        };
+      }, false);
+      list.reload();
+    };
+    $('#btnBrowse').onclick = open;
+    $('#browsePw').addEventListener('keydown', e => { if (e.key === 'Enter') open(); });
+    try {
+      const saved = localStorage.getItem(BROWSE_KEY);
+      if (saved) { $('#browsePw').value = saved; $('#browseRemember').checked = true; open(); }
+    } catch {}
+    return { refresh: () => { if (list) list.reload(); } };
+  }
+
+  // ================= 檔案清單（取件連結與上傳紀錄共用）=================
+  // load() 回傳 { banner, groups: [{ id, title, files }] }；id 是該批檔案的取件碼
+  function fileList(load, selectAll) {
     $('#recvView').classList.remove('hidden');
     const canPickDir = typeof window.showDirectoryPicker === 'function';
     $('#dlHint').textContent = canPickDir
       ? '勾選多個檔案時會請你選一個本機資料夾，檔案逐一存進去，不會壓縮。'
       : '這個瀏覽器會逐一下載勾選的檔案（不壓縮）。';
-    let items = [];             // { id, name, size, state: '' | loading | done | error, note }
+    let groups = [];
+    let items = [];             // { id, dropId, name, size, state: '' | loading | done | error, note }
     const selected = new Set();
     let busy = false;
 
@@ -267,12 +328,14 @@
     const pickable = f => !f.state || f.state === 'error';
 
     function render() {
-      $('#recvList').innerHTML = items.map(f => {
-        const lead = pickable(f)
-          ? `<input type="checkbox" data-sel ${selected.has(f.id) ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="選取 ${escapeHtml(f.name)}">`
-          : '';
-        return row(f, f.note || '', f.state === 'loading' ? f.pct : null, lead);
-      }).join('');
+      $('#recvList').innerHTML = groups.map(g =>
+        (g.title ? `<div class="group">${escapeHtml(g.title)}</div>` : '') +
+        items.filter(f => f.dropId === g.id).map(f => {
+          const lead = pickable(f)
+            ? `<input type="checkbox" data-sel ${selected.has(f.id) ? 'checked' : ''} ${busy ? 'disabled' : ''} aria-label="選取 ${escapeHtml(f.name)}">`
+            : '';
+          return row(f, f.note || '', f.state === 'loading' ? f.pct : null, lead);
+        }).join('')).join('');
       const n = selected.size;
       const total = items.filter(pickable).length;
       $('#btnDl').disabled = !n || busy;
@@ -280,6 +343,7 @@
       $('#selAll').checked = n > 0 && n === total;
       $('#selAll').indeterminate = n > 0 && n < total;
       $('#selAll').disabled = busy || !total;
+      $('#btnRefresh').disabled = busy;
     }
 
     function saveBlob(blob, name) {
@@ -292,12 +356,23 @@
       setTimeout(() => URL.revokeObjectURL(a.href), 60000);
     }
 
+    // 不同批次可能有同名檔案，存進同一個資料夾時加上編號避免互相覆蓋
+    function uniqueName(used, name) {
+      let out = name;
+      const dot = name.lastIndexOf('.');
+      for (let i = 2; used.has(out.toLowerCase()); i++) {
+        out = dot > 0 ? `${name.slice(0, dot)} (${i})${name.slice(dot)}` : `${name} (${i})`;
+      }
+      used.add(out.toLowerCase());
+      return out;
+    }
+
     // 邊下載邊回報進度；有選資料夾就直接寫進檔案，否則先收在記憶體再觸發下載
-    async function fetchOne(file, root) {
-      const { url } = await api('download', { id: code, fileId: file.id });
+    async function fetchOne(file, root, saveAs) {
+      const { url } = await api('download', { id: file.dropId, fileId: file.id });
       const res = await fetch(SUPABASE_URL + url);
       if (!res.ok) throw new Error('HTTP ' + res.status);
-      const writer = root ? await (await root.getFileHandle(file.name, { create: true })).createWritable() : null;
+      const writer = root ? await (await root.getFileHandle(saveAs, { create: true })).createWritable() : null;
       const parts = [];
       const reader = res.body.getReader();
       let got = 0;
@@ -315,7 +390,7 @@
         if (writer) await writer.abort().catch(() => {});
         throw e;
       }
-      if (!writer) saveBlob(new Blob(parts), file.name);
+      if (!writer) saveBlob(new Blob(parts), saveAs);
     }
 
     async function download() {
@@ -328,17 +403,18 @@
       }
       busy = true;
       let ok = 0;
+      const used = new Set();
       for (const file of picks) {
         selected.delete(file.id);
         Object.assign(file, { state: 'loading', pct: 0, note: '下載中' });
         render();
         try {
-          await fetchOne(file, root);
+          await fetchOne(file, root, uniqueName(used, file.name));
           ok++;
           file.state = 'done';
           file.note = '已下載';
           // 存檔成功才通知伺服器刪除；通知失敗也不影響已下載的檔案，到期仍會自動清除
-          try { if ((await api('done', { id: code, fileId: file.id })).deleted) file.note = '已下載，伺服器上的檔案已刪除'; } catch {}
+          try { if ((await api('done', { id: file.dropId, fileId: file.id })).deleted) file.note = '已下載，伺服器上的檔案已刪除'; } catch {}
           if (!root) await sleep(400);
         } catch (e) {
           file.state = 'error';
@@ -351,19 +427,24 @@
       render();
     }
 
-    async function load() {
+    async function reload() {
+      if (busy) return;
       try {
-        const data = await api('list', { id: code });
-        items = data.files.map(f => ({ ...f, state: '', note: '' }));
-        for (const f of items) selected.add(f.id);
-        banner(`${data.deleteAfter ? '下載後檔案會自動從伺服器刪除' : '可重複下載'}；保存到 ${fmtTime(data.expiresAt)}。`);
+        const data = await load();
+        groups = data.groups;
+        items = groups.flatMap(g => g.files.map(f => ({ ...f, dropId: g.id, state: '', note: '' })));
+        selected.clear();
+        if (selectAll) for (const f of items) selected.add(f.id);
+        banner(data.banner);
       } catch (e) {
+        groups = []; items = []; selected.clear();
         banner(e.message);
       }
       render();
     }
 
     $('#btnDl').onclick = download;
+    $('#btnRefresh').onclick = reload;
     $('#selAll').onchange = e => {
       selected.clear();
       if (e.target.checked) for (const f of items) if (pickable(f)) selected.add(f.id);
@@ -375,7 +456,7 @@
       e.target.checked ? selected.add(id) : selected.delete(id);
       render();
     });
-    load();
+    return { reload };
   }
 })();
 </script>
